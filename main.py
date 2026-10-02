@@ -3,7 +3,7 @@ import os
 from dotenv import load_dotenv
 
 from schemas import ChatMessage, ModelConfig
-from clients import BaseLLMClient, OpenAIClient, AnthropicClient
+from clients import BaseLLMClient, OpenAIClient, AnthropicClient, GeminiClient
 
 async def run_client_demo(client_name: str, client: BaseLLMClient, messages: list[ChatMessage]):
     print(f"\n{'='*50}\nIniciando test para: {client_name}\n{'='*50}")
@@ -29,7 +29,8 @@ async def main():
     
     openai_key = os.getenv("OPENAI_API_KEY")
     anthropic_key = os.getenv("ANTHROPIC_API_KEY")
-    
+    gemini_key = os.getenv("GEMINI_API_KEY")
+
     messages = [
         ChatMessage(role="system", content="Eres un asistente conciso."),
         ChatMessage(role="user", content="¿Qué es la entropía? Explícalo en una sola oración.")
@@ -50,6 +51,13 @@ async def main():
         tasks.append(run_client_demo("Anthropic (claude-3-haiku)", anthropic_client, messages))
     else:
         print("Aviso: ANTHROPIC_API_KEY no encontrada.")
+
+    if gemini_key:
+        gemini_config = ModelConfig(model="gemini-1.5-flash", temperature=0.5)
+        gemini_client = GeminiClient(api_key=gemini_key, config=gemini_config)
+        tasks.append(run_client_demo("Gemini (gemini-1.5-flash)", gemini_client, messages))
+    else:
+        print("Aviso: GEMINI_API_KEY no encontrada.")
         
     if tasks:
         await asyncio.gather(*tasks)
