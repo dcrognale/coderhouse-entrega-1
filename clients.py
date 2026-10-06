@@ -1,6 +1,8 @@
 import abc
+import asyncio
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable, Coroutine
+from typing import Any, TypeVar
 
 from anthropic import NOT_GIVEN, AsyncAnthropic
 from anthropic import APIError as AnthropicError
@@ -13,6 +15,71 @@ from openai import AsyncOpenAI
 from schemas import ChatMessage, ModelConfig, ModelResponse
 
 logger = logging.getLogger(__name__)
+MAX_RETRIES = 3
+T = TypeVar("T")
+
+
+def _is_server_error(error: Exception) -> bool:
+    status = getattr(error, "status_code", None)
+    if status is None:
+        status = getattr(error, "code", None)
+
+    try:
+        status_code = int(status)
+    except (TypeError, ValueError):
+        return False
+
+    return 500 <= status_code <= 599
+
+
+async def _retry_async(operation: Callable[[], Coroutine[Any, Any, T]]) -> T:
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            return await operation()
+        except Exception as error:
+            if not _is_server_error(error) or attempt == MAX_RETRIES:
+                raise
+
+            delay = min(2**attempt, 8)
+            logger.warning(
+                "Error HTTP 5xx; reintento %d/%d en %d segundos: %s",
+                attempt + 1,
+                MAX_RETRIES,
+                delay,
+                error,
+            )
+            await asyncio.sleep(delay)
+
+    raise RuntimeError("Retry loop ended unexpectedly")
+
+
+async def _retry_stream(
+    stream_factory: Callable[[], AsyncGenerator[str, None]],
+) -> AsyncGenerator[str, None]:
+    for attempt in range(MAX_RETRIES + 1):
+        yielded_content = False
+        try:
+            async for chunk in stream_factory():
+                yielded_content = True
+                yield chunk
+            return
+        except Exception as error:
+            if (
+                yielded_content
+                or not _is_server_error(error)
+                or attempt == MAX_RETRIES
+            ):
+                raise
+
+            delay = min(2**attempt, 8)
+            logger.warning(
+                "Error HTTP 5xx en streaming; reintento %d/%d en %d segundos: %s",
+                attempt + 1,
+                MAX_RETRIES,
+                delay,
+                error,
+            )
+            await asyncio.sleep(delay)
 
 
 class BaseLLMClient(abc.ABC):
@@ -36,11 +103,13 @@ class OpenAIClient(BaseLLMClient):
     async def generate(self, messages: list[ChatMessage]) -> ModelResponse:
         try:
             formatted_messages = [msg.model_dump() for msg in messages]
-            response = await self.client.chat.completions.create(
-                model=self.config.model,
-                messages=formatted_messages,
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
+            response = await _retry_async(
+                lambda: self.client.chat.completions.create(
+                    model=self.config.model,
+                    messages=formatted_messages,
+                    temperature=self.config.temperature,
+                    max_tokens=self.config.max_tokens,
+                )
             )
             return ModelResponse(
                 content=response.choices[0].message.content or "",
@@ -57,16 +126,20 @@ class OpenAIClient(BaseLLMClient):
     async def stream(self, messages: list[ChatMessage]) -> AsyncGenerator[str, None]:
         try:
             formatted_messages = [msg.model_dump() for msg in messages]
-            response_stream = await self.client.chat.completions.create(
-                model=self.config.model,
-                messages=formatted_messages,
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
-                stream=True,
-            )
-            async for chunk in response_stream:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
+            async def request_stream() -> AsyncGenerator[str, None]:
+                response_stream = await self.client.chat.completions.create(
+                    model=self.config.model,
+                    messages=formatted_messages,
+                    temperature=self.config.temperature,
+                    max_tokens=self.config.max_tokens,
+                    stream=True,
+                )
+                async for chunk in response_stream:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        yield chunk.choices[0].delta.content
+
+            async for text in _retry_stream(request_stream):
+                yield text
         except OpenAIError as e:
             logger.error(f"OpenAI Stream Error: {e}")
             yield f"\n[Stream interrumpido por error: {str(e)}]"
@@ -95,12 +168,14 @@ class AnthropicClient(BaseLLMClient):
     async def generate(self, messages: list[ChatMessage]) -> ModelResponse:
         try:
             system, formatted_messages = self._format_messages(messages)
-            response = await self.client.messages.create(
-                model=self.config.model,
-                system=system or NOT_GIVEN,
-                messages=formatted_messages,
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
+            response = await _retry_async(
+                lambda: self.client.messages.create(
+                    model=self.config.model,
+                    system=system or NOT_GIVEN,
+                    messages=formatted_messages,
+                    temperature=self.config.temperature,
+                    max_tokens=self.config.max_tokens,
+                )
             )
             content = "".join(
                 block.text for block in response.content if block.type == "text"
@@ -123,15 +198,19 @@ class AnthropicClient(BaseLLMClient):
     async def stream(self, messages: list[ChatMessage]) -> AsyncGenerator[str, None]:
         try:
             system, formatted_messages = self._format_messages(messages)
-            async with self.client.messages.stream(
-                model=self.config.model,
-                system=system or NOT_GIVEN,
-                messages=formatted_messages,
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
-            ) as stream:
-                async for text in stream.text_stream:
-                    yield text
+            async def request_stream() -> AsyncGenerator[str, None]:
+                async with self.client.messages.stream(
+                    model=self.config.model,
+                    system=system or NOT_GIVEN,
+                    messages=formatted_messages,
+                    temperature=self.config.temperature,
+                    max_tokens=self.config.max_tokens,
+                ) as stream:
+                    async for text in stream.text_stream:
+                        yield text
+
+            async for text in _retry_stream(request_stream):
+                yield text
         except AnthropicError as e:
             logger.error(f"Anthropic Stream Error: {e}")
             yield f"\n[Stream interrumpido por error: {str(e)}]"
@@ -178,10 +257,12 @@ class GeminiClient(BaseLLMClient):
         try:
             system_instruction, contents = self._format_messages(messages)
 
-            response = await self.client.aio.models.generate_content(
-                model=self.config.model,
-                contents=contents,
-                config=self._build_config(system_instruction),
+            response = await _retry_async(
+                lambda: self.client.aio.models.generate_content(
+                    model=self.config.model,
+                    contents=contents,
+                    config=self._build_config(system_instruction),
+                )
             )
 
             usage_data = None
@@ -208,15 +289,18 @@ class GeminiClient(BaseLLMClient):
         try:
             system_instruction, contents = self._format_messages(messages)
 
-            response_stream = await self.client.aio.models.generate_content_stream(
-                model=self.config.model,
-                contents=contents,
-                config=self._build_config(system_instruction),
-            )
+            async def request_stream() -> AsyncGenerator[str, None]:
+                response_stream = await self.client.aio.models.generate_content_stream(
+                    model=self.config.model,
+                    contents=contents,
+                    config=self._build_config(system_instruction),
+                )
+                async for chunk in response_stream:
+                    if chunk.text:
+                        yield chunk.text
 
-            async for chunk in response_stream:
-                if chunk.text:
-                    yield chunk.text
+            async for text in _retry_stream(request_stream):
+                yield text
 
         except genai_errors.APIError as e:
             logger.error(f"Gemini Stream Error: {e}")

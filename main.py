@@ -53,14 +53,17 @@ async def main():
         print("Aviso: ANTHROPIC_API_KEY no encontrada.")
 
     if gemini_key:
-        gemini_config = ModelConfig(model="gemini-1.5-flash", temperature=0.5)
+        gemini_config = ModelConfig(model="gemini-3.8-flash", temperature=0.5)
         gemini_client = GeminiClient(api_key=gemini_key, config=gemini_config)
-        tasks.append(run_client_demo("Gemini (gemini-1.5-flash)", gemini_client, messages))
+        tasks.append(run_client_demo("Gemini (gemini-3.8-flash)", gemini_client, messages))
     else:
         print("Aviso: GEMINI_API_KEY no encontrada.")
         
     if tasks:
-        await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                print(f"Error inesperado al ejecutar un proveedor: {result}")
 
 if __name__ == "__main__":
     asyncio.run(main())
